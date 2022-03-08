@@ -1,4 +1,4 @@
-require "rails"
+require 'rails'
 
 module RLS
   def self.configure
@@ -13,12 +13,13 @@ module RLS
     config.rls_rails.user_class = nil
     config.rls_rails.tenant_fk = :tenant_id
     config.rls_rails.verbose = false
+    config.rls_rails.unprivileged_db_role = nil
 
-    initializer "rls_rails.load" do
+    initializer 'rls_rails.load' do
       ActiveSupport.on_load :active_record do
         ActiveRecord::Migration.include RLS::Statements
-        #ActiveRecord::Migration::CommandRecorder.include Scenic::CommandRecorder
-        #ActiveRecord::SchemaDumper.prepend Scenic::SchemaDumper
+        # ActiveRecord::Migration::CommandRecorder.include Scenic::CommandRecorder
+        # ActiveRecord::SchemaDumper.prepend Scenic::SchemaDumper
 
         ActiveRecord::Base.connection.class.set_callback :checkout, :after do
           # ensure the RLS-related session variables are reset when a

@@ -8,7 +8,8 @@ module RLS
     return if RLS.status[:disable] === 'true' # do not use disabled? here since it may be blank
 
     clear_query_cache
-    execute_sql("SET SESSION rls.disable = TRUE;")
+    execute_sql('SET SESSION rls.disable = TRUE;')
+    set_role(privileged: true)
     thread_rls_status.merge!(disabled: 'true')
     debug_print "WARNING: ROW LEVEL SECURITY DISABLED!\n"
   end
@@ -24,31 +25,35 @@ module RLS
 
     clear_query_cache
     debug_print "ROW LEVEL SECURITY ENABLED!\n"
-    execute_sql("SET SESSION rls.disable = FALSE;")
+    execute_sql('SET SESSION rls.disable = FALSE;')
+    set_role(privileged: false)
     thread_rls_status.merge!(disabled: 'false')
   end
 
   def self.enabled?
-    !self.disabled?
+    !disabled?
   end
 
-  def self.set_tenant tenant
-    raise "Tenant is nil!" unless tenant.present?
-    return if self.status[:tenant_id] === tenant.id&.to_s && enabled?
+  def self.set_tenant(tenant)
+    raise 'Tenant is nil!' unless tenant.present?
+    return if status[:tenant_id] === tenant.id&.to_s && enabled?
 
     clear_query_cache
     debug_print "Accessing database as #{tenant.try(:name) || "tenant id #{tenant.id}"}\n"
     execute_sql "SET SESSION rls.disable = FALSE; SET SESSION rls.tenant_id = #{tenant.id};"
+    set_role(privileged: false)
+    execute_sql("SET ROLE #{unprivileged_db_role}") if unprivileged_db_role.present?
     thread_rls_status.merge!(tenant_id: tenant.id.to_s)
   end
 
-  def self.set_user user
-    raise "User is nil!" unless user.present?
-    return if self.status[:user_id] === user.id&.to_s && enabled?
+  def self.set_user(user)
+    raise 'User is nil!' unless user.present?
+    return if status[:user_id] === user.id&.to_s && enabled?
 
     clear_query_cache
     debug_print "Accessing database as #{user.class}##{user.id}\n"
     execute_sql "SET SESSION rls.disable = FALSE; SET SESSION rls.user_id = #{user.id};"
+    set_role(privileged: false)
     thread_rls_status.merge!(user_id: user.id.to_s)
   end
 
@@ -60,7 +65,7 @@ module RLS
 
   # Resets all session variables set by this gem
   def self.reset!
-    return if self.status[:tenant_id] === '' && self.status[:user_id] === '' && self.status[:disabled] === ''
+    return if status[:tenant_id] === '' && status[:user_id] === '' && status[:disabled] === ''
 
     debug_print "Resetting RLS settings.\n"
     execute_sql <<-SQL
@@ -68,6 +73,7 @@ module RLS
       RESET rls.tenant_id;
       RESET rls.disable;
     SQL
+    set_role(privileged: false)
     clear_query_cache
     thread_rls_status.merge!(tenant_id: '', user_id: '', disabled: '')
   end
@@ -75,11 +81,13 @@ module RLS
   # Sets the RLS status to the given value in one go.
   # @param status [Hash]
   # @see #status
-  def self.status= status
+  def self.status=(status)
     tenant_id = status[:tenant_id].to_s
     user_id = status[:user_id].to_s
     disable = status[:disable].nil? ? 'false' : status[:disable].to_s
-    return if self.status[:tenant_id] === tenant_id && self.status[:user_id] === user_id && self.status[:disabled] === disable
+    if self.status[:tenant_id] === tenant_id && self.status[:user_id] === user_id && self.status[:disabled] === disable
+      return
+    end
 
     clear_query_cache
     execute_sql <<-SQL.strip_heredoc
@@ -87,6 +95,7 @@ module RLS
       SET SESSION rls.user_id   = '#{user_id}';
       SET SESSION rls.tenant_id = '#{tenant_id}';
     SQL
+    set_role(privileged: status[:disable] && status[:disable] != 'false')
     thread_rls_status.merge!(tenant_id: tenant_id, user_id: user_id, disabled: disable)
   end
 
@@ -94,28 +103,30 @@ module RLS
   # @see #status
   def self.status
     result = execute_sql(<<-SQL).values[0]
-      SELECT current_setting('rls.tenant_id', TRUE), 
+      SELECT current_setting('rls.tenant_id', TRUE),#{' '}
              current_setting('rls.user_id',   TRUE),
              current_setting('rls.disable',   TRUE);
     SQL
-    [:tenant_id, :user_id, :disable].zip(result).to_h
+    %i[tenant_id user_id disable].zip(result).to_h
   end
 
   def self.current_tenant
     id = current_tenant_id
     return nil unless id
+
     tenant_class.find id
   end
 
   def self.current_user
     id = current_user_id
     return nil unless id
+
     user_class.find id
   end
 
-  def self.disable_for_block &block
-    self.restore_status_after_block do
-      self.disable!
+  def self.disable_for_block(&block)
+    restore_status_after_block do
+      disable!
       yield(block)
     end
   end
@@ -123,28 +134,38 @@ module RLS
   # Enables RLS and sets the current tenant to the given value for the given block
   # and restores the initial configuration afterwards.
   # @param tenant
-  def self.set_tenant_for_block tenant, &block
-    self.restore_status_after_block do
-      self.enable!
-      self.set_tenant tenant
+  def self.set_tenant_for_block(tenant, &block)
+    restore_status_after_block do
+      enable!
+      set_tenant tenant
       yield tenant, block
     end
   end
 
   # Ensures that the initial RLS-state is restored after the given block is run
-  def self.restore_status_after_block &block
-    status_was = self.status
+  def self.restore_status_after_block(&block)
+    status_was = status
     yield block
   ensure
     self.status = status_was
   end
 
-  def self.run_per_tenant &block
-    self.restore_status_after_block do
+  def self.run_per_tenant(&block)
+    restore_status_after_block do
       tenant_class.all.map do |tenant|
         RLS.set_tenant tenant
         yield tenant, block
       end
+    end
+  end
+
+  def self.set_role(privileged: false)
+    return unless unprivileged_db_role.present?
+
+    if privileged
+      execute_sql('SET ROLE NONE;')
+    else
+      execute_sql("SET ROLE #{unprivileged_db_role};")
     end
   end
 
@@ -156,21 +177,23 @@ module RLS
     Railtie.config.rls_rails.user_class
   end
 
-  private
+  def self.unprivileged_db_role
+    Railtie.config.rls_rails.unprivileged_db_role
+  end
 
   def self.clear_query_cache
     ActiveRecord::Base.connection.clear_query_cache
   end
 
-  def self.execute_sql query
+  def self.execute_sql(query)
     ActiveRecord::Base.connection.execute query
   end
 
-  def self.debug_print s
+  def self.debug_print(s)
     print s if Railtie.config.rls_rails.verbose
   end
 
   def self.thread_rls_status
-    Thread.current["rls_status"] ||= { user_id: '', tenant_id: '', disabled: '' }
+    Thread.current['rls_status'] ||= { user_id: '', tenant_id: '', disabled: '' }
   end
 end
