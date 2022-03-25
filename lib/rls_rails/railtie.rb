@@ -30,8 +30,6 @@ module RLS
             RESET rls.disable;
           SQL
 
-          clear_query_cache
-
           RLS.thread_rls_status.merge!(tenant_id: '', user_id: '', disabled: '')
         end
       end

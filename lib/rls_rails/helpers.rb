@@ -7,7 +7,7 @@ module RLS
   def self.disable!
     return if RLS.status[:disable] === 'true' # do not use disabled? here since it may be blank
 
-    clear_query_cache
+    enable_query_cache
     execute_sql('SET SESSION rls.disable = TRUE;')
     set_role(privileged: true)
     thread_rls_status.merge!(disabled: 'true')
@@ -23,7 +23,7 @@ module RLS
   def self.enable!
     return if enabled?
 
-    clear_query_cache
+    disable_query_cache
     debug_print "ROW LEVEL SECURITY ENABLED!\n"
     execute_sql('SET SESSION rls.disable = FALSE;')
     set_role(privileged: false)
@@ -38,7 +38,7 @@ module RLS
     raise 'Tenant is nil!' unless tenant.present?
     return if status[:tenant_id] === tenant.id&.to_s && enabled?
 
-    clear_query_cache
+    disable_query_cache
     debug_print "Accessing database as #{tenant.try(:name) || "tenant id #{tenant.id}"}\n"
     execute_sql "SET SESSION rls.disable = FALSE; SET SESSION rls.tenant_id = #{tenant.id};"
     set_role(privileged: false)
@@ -50,7 +50,7 @@ module RLS
     raise 'User is nil!' unless user.present?
     return if status[:user_id] === user.id&.to_s && enabled?
 
-    clear_query_cache
+    disable_query_cache
     debug_print "Accessing database as #{user.class}##{user.id}\n"
     execute_sql "SET SESSION rls.disable = FALSE; SET SESSION rls.user_id = #{user.id};"
     set_role(privileged: false)
@@ -74,7 +74,7 @@ module RLS
       RESET rls.disable;
     SQL
     set_role(privileged: false)
-    clear_query_cache
+    enable_query_cache
     thread_rls_status.merge!(tenant_id: '', user_id: '', disabled: '')
   end
 
@@ -89,7 +89,12 @@ module RLS
       return
     end
 
-    clear_query_cache
+    if status[:disable] && status[:disable] != 'false'
+      enable_query_cache
+    else
+      disable_query_cache
+    end
+
     execute_sql <<-SQL.strip_heredoc
       SET SESSION rls.disable   = '#{disable}';
       SET SESSION rls.user_id   = '#{user_id}';
@@ -183,6 +188,14 @@ module RLS
 
   def self.clear_query_cache
     ActiveRecord::Base.connection.clear_query_cache
+  end
+
+  def self.disable_query_cache
+    ActiveRecord::Base.connection.disable_query_cache!
+  end
+
+  def self.enable_query_cache
+    ActiveRecord::Base.connection.enable_query_cache!
   end
 
   def self.execute_sql(query)
