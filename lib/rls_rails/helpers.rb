@@ -150,9 +150,11 @@ module RLS
   # Ensures that the initial RLS-state is restored after the given block is run
   def self.restore_status_after_block(&block)
     status_was = status
-    yield block
-  ensure
-    self.status = status_was
+    begin
+      yield block
+    ensure
+      self.status = status_was
+    end
   end
 
   def self.run_per_tenant(&block)
