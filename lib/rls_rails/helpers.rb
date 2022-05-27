@@ -96,9 +96,7 @@ module RLS
     end
 
     execute_sql <<-SQL.strip_heredoc
-      SET SESSION rls.disable   = '#{disable}';
-      SET SESSION rls.user_id   = '#{user_id}';
-      SET SESSION rls.tenant_id = '#{tenant_id}';
+      SET SESSION rls.disable = '#{disable}'; SET SESSION rls.user_id = '#{user_id}'; SET SESSION rls.tenant_id = '#{tenant_id}';
     SQL
     set_role(privileged: status[:disable] && status[:disable] != 'false')
     thread_rls_status.merge!(tenant_id: tenant_id, user_id: user_id, disabled: disable)
@@ -108,9 +106,7 @@ module RLS
   # @see #status
   def self.status
     result = execute_sql(<<-SQL).values[0]
-      SELECT current_setting('rls.tenant_id', TRUE),#{' '}
-             current_setting('rls.user_id',   TRUE),
-             current_setting('rls.disable',   TRUE);
+      SELECT current_setting('rls.tenant_id', TRUE), current_setting('rls.user_id', TRUE), current_setting('rls.disable', TRUE);
     SQL
     %i[tenant_id user_id disable].zip(result).to_h
   end

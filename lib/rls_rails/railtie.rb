@@ -25,9 +25,7 @@ module RLS
           # ensure the RLS-related session variables are reset when a
           # thread checks out a connection
           execute <<~SQL
-            RESET rls.user_id;
-            RESET rls.tenant_id;
-            RESET rls.disable;
+            RESET rls.user_id; RESET rls.tenant_id; RESET rls.disable;
           SQL
 
           RLS.thread_rls_status.merge!(tenant_id: '', user_id: '', disabled: '')
