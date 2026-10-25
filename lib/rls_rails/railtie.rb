@@ -17,6 +17,39 @@ module RLS
     end
   end
 
+  # Postgres undoes a SET made inside a transaction or savepoint that rolls back.
+  # Read back what it restored, so a later reconnect re-applies the right status.
+  # The cache is emptied first: if the rollback itself fails, a reconnect then
+  # starts unscoped rather than re-applying a tenant set inside the transaction.
+  module ReloadStatusOnRollback
+    def rollback_db_transaction(...)
+      @rls_status = nil
+      super
+      reload_rls_status
+    end
+
+    def rollback_to_savepoint(...)
+      @rls_status = nil
+      super
+      reload_rls_status
+    end
+
+    def restart_db_transaction(...)
+      @rls_status = nil
+      super
+      reload_rls_status
+    end
+
+    private
+
+    def reload_rls_status
+      values = select_rows(<<~SQL).first.map(&:to_s)
+        SELECT current_setting('rls.tenant_id', TRUE), current_setting('rls.user_id', TRUE), current_setting('rls.disable', TRUE)
+      SQL
+      @rls_status = %i[tenant_id user_id disable].zip(values).to_h
+    end
+  end
+
   def self.configure
     @configuration ||= Railtie.config.rls_rails
     yield @configuration if block_given?
@@ -39,12 +72,12 @@ module RLS
 
         adapter = ActiveRecord::Base.connection.class
         adapter.prepend RLS::ReapplyStatusOnReconnect
+        adapter.prepend RLS::ReloadStatusOnRollback
 
-        # A connection handed to another thread must not keep the previous thread's settings.
+        # A connection handed to another thread must not keep the previous thread's
+        # settings or role. It goes back to how a fresh connection starts.
         adapter.set_callback :checkout, :after do
-          execute "RESET rls.user_id; RESET rls.tenant_id; RESET rls.disable;"
-          role = RLS.unprivileged_db_role
-          execute "SET ROLE #{role};" if role.present?
+          execute "RESET rls.user_id; RESET rls.tenant_id; RESET rls.disable; RESET ROLE;"
           @rls_status = { tenant_id: '', user_id: '', disable: '' }
         end
       end
