@@ -1,52 +1,68 @@
 require "rails"
 
 module RLS
-  # A reconnect opens a fresh session without the gem's settings, logged in as the
-  # privileged role. Re-apply what the connection had, so it stays scoped.
-  module ReapplyStatusOnReconnect
+  # A new or reconnected session starts with no settings, on the login role. Re-apply
+  # what the connection had, or the default when it had nothing, so it stays scoped.
+  module ReapplyStatusOnConnect
     def configure_connection
       super
       status = @rls_status
-      @rls_status = nil
-      return if status.nil? || status.values.all?(&:empty?)
-
-      execute "SET SESSION rls.disable = '#{status[:disable]}'; SET SESSION rls.user_id = '#{status[:user_id]}'; SET SESSION rls.tenant_id = '#{status[:tenant_id]}';"
-      role = RLS.unprivileged_db_role
-      execute(status[:disable] == 'true' ? 'SET ROLE NONE;' : "SET ROLE #{role};") if role.present?
-      @rls_status = status
+      @rls_status = { tenant_id: '', user_id: '', disable: '', privileged: true }
+      @rls_transaction_status = nil
+      @rls_savepoint_statuses = {}
+      RLS.apply(status&.slice(*RLS::STATUS_KEYS) || RLS.connection_default_status, self)
     end
   end
 
-  # Postgres undoes a SET made inside a transaction or savepoint that rolls back.
-  # Read back what it restored, so a later reconnect re-applies the right status.
-  # The cache is emptied first: if the rollback itself fails, a reconnect then
-  # starts unscoped rather than re-applying a tenant set inside the transaction.
-  module ReloadStatusOnRollback
-    def rollback_db_transaction(...)
-      @rls_status = nil
+  # Postgres undoes a SET made inside a transaction or savepoint that rolls back, back
+  # to its value when the transaction or savepoint began. Snapshot the status there and
+  # restore it on rollback, without querying: the connection may already be gone, and
+  # a later reconnect re-applies the snapshot.
+  module RestoreStatusOnRollback
+    def begin_db_transaction(...)
+      @rls_transaction_status = @rls_status&.dup
       super
-      reload_rls_status
     end
 
-    def rollback_to_savepoint(...)
-      @rls_status = nil
+    def begin_isolated_db_transaction(...)
+      @rls_transaction_status = @rls_status&.dup
       super
-      reload_rls_status
+    end
+
+    def commit_db_transaction(...)
+      super
+      @rls_transaction_status = nil
+      @rls_savepoint_statuses&.clear
+    end
+
+    def rollback_db_transaction(...)
+      super
+    ensure
+      @rls_status = @rls_transaction_status
+      @rls_transaction_status = nil
+      @rls_savepoint_statuses&.clear
     end
 
     def restart_db_transaction(...)
-      @rls_status = nil
       super
-      reload_rls_status
+      @rls_status = @rls_transaction_status&.dup
+      @rls_savepoint_statuses&.clear
     end
 
-    private
+    def create_savepoint(name = current_savepoint_name)
+      (@rls_savepoint_statuses ||= {})[name] = @rls_status&.dup
+      super
+    end
 
-    def reload_rls_status
-      values = select_rows(<<~SQL).first.map(&:to_s)
-        SELECT current_setting('rls.tenant_id', TRUE), current_setting('rls.user_id', TRUE), current_setting('rls.disable', TRUE)
-      SQL
-      @rls_status = %i[tenant_id user_id disable].zip(values).to_h
+    # Also how Active Record restarts a savepoint, so the snapshot stays until release.
+    def rollback_to_savepoint(name = current_savepoint_name)
+      super
+      @rls_status = @rls_savepoint_statuses[name]&.dup if @rls_savepoint_statuses&.key?(name)
+    end
+
+    def release_savepoint(name = current_savepoint_name)
+      super
+      @rls_savepoint_statuses&.delete(name)
     end
   end
 
@@ -63,27 +79,32 @@ module RLS
     config.rls_rails.tenant_fk = :tenant_id
     config.rls_rails.verbose = false
     config.rls_rails.unprivileged_db_role = nil
+    config.rls_rails.connections_start_privileged = false
 
     initializer "rls_rails.load" do
       ActiveSupport.on_load :active_record do
         ActiveRecord::Migration.include RLS::Statements
         #ActiveRecord::Migration::CommandRecorder.include Scenic::CommandRecorder
         #ActiveRecord::SchemaDumper.prepend Scenic::SchemaDumper
+      end
 
-        adapter = ActiveRecord::Base.connection.class
-        adapter.prepend RLS::ReapplyStatusOnReconnect
-        adapter.prepend RLS::ReloadStatusOnRollback
+      ActiveSupport.on_load :active_record_postgresqladapter do
+        prepend RLS::ReapplyStatusOnConnect
+        prepend RLS::RestoreStatusOnRollback
 
         # A connection handed to another thread must not keep the previous thread's
-        # settings or role. It goes back to how a fresh connection starts.
-        adapter.set_callback :checkout, :after do
-          execute "RESET rls.user_id; RESET rls.tenant_id; RESET rls.disable; RESET ROLE;"
-          @rls_status = { tenant_id: '', user_id: '', disable: '' }
+        # settings or role. A connection not yet connected gets them on connect.
+        set_callback :checkout, :after do
+          RLS.apply(RLS.connection_default_status, self) if @rls_status
         end
       end
     end
 
     rake_tasks do
+      # Rake runs migrations, schema loads and policy tasks, which need the role that
+      # owns the tables. Servers and workers never load tasks, so they start closed.
+      config.rls_rails.connections_start_privileged = true
+
       load 'rls_rails/tasks/init.rake'
       load 'rls_rails/tasks/recreate.rake'
     end
