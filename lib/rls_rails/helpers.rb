@@ -1,13 +1,11 @@
 require 'concurrent'
 
 module RLS
-  def self.disable!
-    return if RLS.status[:disable] === 'true' # do not use disabled? here since it may be blank
+  STATUS_KEYS = %i[tenant_id user_id disable].freeze
 
-    clear_query_cache
-    execute_sql("SET SESSION rls.disable = TRUE;")
-    set_role(privileged: true)
-    cached_status.merge!(disable: 'true')
+  def self.disable!
+    return unless apply status.merge(disable: 'true')
+
     debug_print "WARNING: ROW LEVEL SECURITY DISABLED!\n"
   end
 
@@ -18,11 +16,8 @@ module RLS
   def self.enable!
     return if enabled?
 
-    clear_query_cache
+    apply status.merge(disable: 'false')
     debug_print "ROW LEVEL SECURITY ENABLED!\n"
-    execute_sql("SET SESSION rls.disable = FALSE;")
-    set_role(privileged: false)
-    cached_status.merge!(disable: 'false')
   end
 
   def self.enabled?
@@ -31,25 +26,20 @@ module RLS
 
   def self.set_tenant tenant
     raise "Tenant is nil!" unless tenant.present?
-    return if self.status[:tenant_id] === tenant.id&.to_s && enabled?
 
-    clear_query_cache
-    
+    target = status.merge(tenant_id: tenant.id.to_s, disable: 'false')
+    return unless apply target
+
     debug_print "Accessing database as #{tenant.try(:name) || "tenant id #{tenant.id}"}\n"
-    execute_sql "SET SESSION rls.disable = FALSE; SET SESSION rls.tenant_id = '#{tenant.id}';"
-    set_role(privileged: false)
-    cached_status.merge!(tenant_id: tenant.id.to_s, disable: 'false')
   end
 
   def self.set_user user
     raise "User is nil!" unless user.present?
-    return if self.status[:user_id] === user.id&.to_s && enabled?
 
-    clear_query_cache
+    target = status.merge(user_id: user.id.to_s, disable: 'false')
+    return unless apply target
+
     debug_print "Accessing database as #{user.class}##{user.id}\n"
-    execute_sql "SET SESSION rls.disable = FALSE; SET SESSION rls.user_id = '#{user.id}';"
-    set_role(privileged: false)
-    cached_status.merge!(user_id: user.id.to_s, disable: 'false')
   end
 
   def self.current_tenant_id
@@ -62,59 +52,71 @@ module RLS
 
   # Resets all session variables set by this gem
   def self.reset!
-    return if self.status[:tenant_id] === '' && self.status[:user_id] === '' && self.status[:disable] === ''
+    return unless apply(tenant_id: '', user_id: '', disable: '')
 
     debug_print "Resetting RLS settings.\n"
-    execute_sql <<-SQL
-      RESET rls.user_id;
-      RESET rls.tenant_id;
-      RESET rls.disable;
-    SQL
-    set_role(privileged: false)
-    clear_query_cache
-    cached_status.merge!(tenant_id: '', user_id: '', disable: '')
   end
 
   # Sets the RLS status to the given value in one go.
   # @param status [Hash]
   # @see #status
   def self.status= status
-    tenant_id = status[:tenant_id].to_s
-    user_id = status[:user_id].to_s
-    disable = status[:disable].nil? ? 'false' : status[:disable].to_s
-    return if self.status[:tenant_id] === tenant_id && self.status[:user_id] === user_id && self.status[:disable] === disable
-
-    clear_query_cache
-    execute_sql <<-SQL.strip_heredoc
-      SET SESSION rls.disable   = '#{disable}';
-      SET SESSION rls.user_id   = '#{user_id}';
-      SET SESSION rls.tenant_id = '#{tenant_id}';
-    SQL
-    set_role(privileged: disable == 'true')
-    cached_status.merge!(tenant_id: tenant_id, user_id: user_id, disable: disable)
+    apply(
+      tenant_id: status[:tenant_id].to_s,
+      user_id: status[:user_id].to_s,
+      disable: status[:disable].nil? ? 'false' : status[:disable].to_s,
+    )
   end
 
   # @return [Hash] Values of the current RLS sesssion
   # @see #status
   def self.status
-    cached_status.dup
+    cached_status.slice(*STATUS_KEYS)
   end
 
-  # The values this gem last set on the current connection. Session variables belong
-  # to the connection, so the cache does too; the database is read only when the
-  # connection has no record yet.
-  def self.cached_status
-    connection = ActiveRecord::Base.connection
-    connection.instance_variable_get(:@rls_status) || connection.instance_variable_set(:@rls_status, read_status)
+  # Brings the connection to the given status, sending only the settings that differ
+  # in a single statement. The role follows the status: the login role only while RLS
+  # is disabled, so a connection with no tenant fails closed.
+  # @return [Boolean] whether anything was sent
+  def self.apply target, connection = ActiveRecord::Base.connection
+    current = cached_status(connection)
+    privileged = target[:disable] == 'true'
+    sql = STATUS_KEYS.filter_map do |key|
+      next if current[key] == target[key]
+
+      target[key].empty? ? "RESET rls.#{key};" : "SET SESSION rls.#{key} = '#{target[key]}';"
+    end
+    if unprivileged_db_role.present? && current[:privileged] != privileged
+      sql << (privileged ? 'SET ROLE NONE;' : "SET ROLE #{unprivileged_db_role};")
+    end
+    return false if sql.empty?
+
+    connection.clear_query_cache
+    connection.execute sql.join(' ')
+    current.merge!(target.slice(*STATUS_KEYS), privileged: privileged)
+    true
   end
 
-  def self.read_status
-    result = execute_sql(<<-SQL).values[0].map(&:to_s)
-      SELECT current_setting('rls.tenant_id', TRUE), 
+  # What a connection is reset to when it is checked out of the pool.
+  def self.connection_default_status
+    { tenant_id: '', user_id: '', disable: connections_start_privileged? ? 'true' : '' }
+  end
+
+  # The values this gem last set on the connection, and whether it is on the login role.
+  # Session variables belong to the connection, so the cache does too; the database is
+  # read only when the connection has no record yet.
+  def self.cached_status connection = ActiveRecord::Base.connection
+    connection.instance_variable_get(:@rls_status) || connection.instance_variable_set(:@rls_status, read_status(connection))
+  end
+
+  def self.read_status connection
+    result = connection.select_rows(<<-SQL).first
+      SELECT current_setting('rls.tenant_id', TRUE),
              current_setting('rls.user_id',   TRUE),
-             current_setting('rls.disable',   TRUE);
+             current_setting('rls.disable',   TRUE),
+             current_user = session_user;
     SQL
-    [:tenant_id, :user_id, :disable].zip(result).to_h
+    STATUS_KEYS.zip(result.first(3).map(&:to_s)).to_h.merge(privileged: result.last)
   end
 
   def self.current_tenant
@@ -141,7 +143,6 @@ module RLS
   # @param tenant
   def self.set_tenant_for_block tenant, &block
     self.restore_status_after_block do
-      self.enable!
       self.set_tenant tenant
       yield tenant, block
     end
@@ -176,17 +177,11 @@ module RLS
     Railtie.config.rls_rails.unprivileged_db_role
   end
 
-  def self.set_role(privileged: false)
-    return unless unprivileged_db_role.present?
-
-    execute_sql(privileged ? 'SET ROLE NONE;' : "SET ROLE #{unprivileged_db_role};")
+  def self.connections_start_privileged?
+    Railtie.config.rls_rails.connections_start_privileged
   end
 
   private
-
-  def self.clear_query_cache
-    ActiveRecord::Base.connection.clear_query_cache
-  end
 
   def self.execute_sql query
     ActiveRecord::Base.connection.execute query

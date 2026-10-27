@@ -18,10 +18,23 @@ RSpec.describe RLS, 'connection status' do
     sql
   end
 
+  describe '.set_tenant_for_block' do
+    it 'sends one statement to enter the block and one to leave it' do
+      tenant
+      expect(statements { RLS.set_tenant_for_block(tenant) {} }.size).to eq 2
+    end
+  end
+
   describe '.set_tenant' do
     it 'sends a single statement' do
       tenant
       expect(statements { RLS.set_tenant tenant }.size).to eq 1
+    end
+
+    # A reset leaves rls.disable as '', which policies cannot cast to a boolean.
+    it 'enables RLS explicitly' do
+      RLS.set_tenant tenant
+      expect(RLS.status[:disable]).to eq 'false'
     end
 
     it 'sends nothing when the tenant is already set' do
@@ -109,6 +122,9 @@ RSpec.describe RLS, 'connection status' do
       ActiveRecord::Base.connection_pool.disconnect!
     end
 
+    # The unprivileged role has no grants in the dummy app, so fixtures are created first.
+    before { RLS.disable_for_block { tenant && other_tenant } }
+
     def database_role
       ActiveRecord::Base.connection.select_value('SELECT current_user')
     end
@@ -124,26 +140,92 @@ RSpec.describe RLS, 'connection status' do
       expect([database_role, database_tenant_id]).to eq ['rls_spec_unprivileged', tenant.id.to_s]
     end
 
-    it 'returns a checked-out connection to the login role' do
+    it 'returns a checked-out connection to the unprivileged role' do
       RLS.set_tenant tenant
+      RLS.disable!
       ActiveRecord::Base.connection_pool.release_connection
-      expect(ActiveRecord::Base.connection.select_value('SELECT current_user = session_user')).to be true
+      expect(database_role).to eq 'rls_spec_unprivileged'
     end
 
-    it 'runs migrations as the role that owns the tables' do
+    it 'puts a new connection on the unprivileged role' do
+      ActiveRecord::Base.connection_pool.disconnect!
+      expect(database_role).to eq 'rls_spec_unprivileged'
+    end
+
+    it 'sends nothing on checkout when the connection is already reset' do
+      RLS.reset!
       ActiveRecord::Base.connection_pool.release_connection
-      Dir.mktmpdir do |dir|
-        File.write File.join(dir, '20200101000000_rls_spec_owner_probe.rb'), <<~RUBY
-          class RlsSpecOwnerProbe < ActiveRecord::Migration[#{ActiveRecord::Migration.current_version}]
-            def up
-              execute 'ALTER TABLE tenants ALTER COLUMN name SET STATISTICS -1'
-            end
-          end
-        RUBY
-        context = ActiveRecord::MigrationContext.new(dir)
-        expect { context.migrate }.not_to raise_error
+      expect(statements { ActiveRecord::Base.connection.verify! }).to be_empty
+    end
+
+    it 're-applies the status from before the transaction when the connection drops during rollback' do
+      other_tenant
+      RLS.set_tenant tenant
+      connection = ActiveRecord::Base.connection
+      connection.transaction do
+        RLS.set_tenant other_tenant
+        allow(connection).to receive(:exec_rollback_db_transaction).and_raise(ActiveRecord::ConnectionFailed)
+        raise ActiveRecord::Rollback
+      end
+      connection.reconnect!
+      expect([database_role, database_tenant_id]).to eq ['rls_spec_unprivileged', tenant.id.to_s]
+    end
+
+    it 'restores the status from before a rolled-back savepoint' do
+      other_tenant
+      RLS.set_tenant tenant
+      status_before = RLS.status
+      ActiveRecord::Base.transaction do
+        ActiveRecord::Base.connection.select_value('SELECT 1') # an empty outer transaction would restart instead of using a savepoint
+        ActiveRecord::Base.transaction(requires_new: true) do
+          RLS.disable!
+          raise ActiveRecord::Rollback
+        end
+        expect([RLS.status, database_role]).to eq [status_before, 'rls_spec_unprivileged']
+      end
+    end
+
+    it 'restores the status when a nested transaction restarts the outer one' do
+      RLS.set_tenant tenant
+      status_before = RLS.status
+      ActiveRecord::Base.transaction do
+        ActiveRecord::Base.transaction(requires_new: true) do
+          RLS.disable!
+          raise ActiveRecord::Rollback
+        end
+        expect([RLS.status, database_role]).to eq [status_before, 'rls_spec_unprivileged']
+      end
+    end
+
+    context 'when connections start privileged' do
+      around do |example|
+        RLS::Railtie.config.rls_rails.connections_start_privileged = true
+        example.run
       ensure
-        RLS.disable_for_block { ActiveRecord::Base.connection.execute "DELETE FROM schema_migrations WHERE version = '20200101000000'" }
+        RLS::Railtie.config.rls_rails.connections_start_privileged = false
+      end
+
+      it 'keeps a new connection on the owner role after a disabled block' do
+        ActiveRecord::Base.connection_pool.disconnect!
+        RLS.disable_for_block {}
+        expect(ActiveRecord::Base.connection.select_value('SELECT current_user = session_user')).to be true
+      end
+
+      it 'runs migrations as the role that owns the tables' do
+        ActiveRecord::Base.connection_pool.release_connection
+        Dir.mktmpdir do |dir|
+          File.write File.join(dir, '20200101000000_rls_spec_owner_probe.rb'), <<~RUBY
+            class RlsSpecOwnerProbe < ActiveRecord::Migration[#{ActiveRecord::Migration.current_version}]
+              def up
+                execute 'ALTER TABLE tenants ALTER COLUMN name SET STATISTICS -1'
+              end
+            end
+          RUBY
+          context = ActiveRecord::MigrationContext.new(dir)
+          expect { context.migrate }.not_to raise_error
+        ensure
+          ActiveRecord::Base.connection.execute "DELETE FROM schema_migrations WHERE version = '20200101000000'"
+        end
       end
     end
   end
